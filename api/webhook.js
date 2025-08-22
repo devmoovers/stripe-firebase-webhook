@@ -165,7 +165,7 @@ export default async function handler(req, res) {
         });
         
         console.log(`✅ Firestore: rôle '${role}' mis à jour pour ${customerEmail}`);
-        console.log(`📊 Données avant:`, currentData);
+        console.log(`📊 Données avant !`, currentData);
       } else {
         console.warn(`❌ Firestore: utilisateur non trouvé (${customerEmail})`);
         // Option: créer l'utilisateur automatiquement
