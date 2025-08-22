@@ -70,13 +70,16 @@ app.post(
       event = stripe.webhooks.constructEvent(
         req.body,
         sig,
-        process.env.STRIPE_WEBHOOK_SECRET
+        process.env.STRIPE_WEBHOOK_SECRET // ✅ pointe bien sur ton .env actuel
       );
     } catch (err) {
       console.error("⚠️ Webhook error:", err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
+    // ---------------------------
+    // Gestion des events Stripe
+    // ---------------------------
     if (
       event.type === "checkout.session.completed" ||
       event.type === "invoice.paid"
