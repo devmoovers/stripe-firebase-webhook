@@ -1,13 +1,10 @@
-import express from "express";
 import Stripe from "stripe";
 import admin from "firebase-admin";
-import dotenv from "dotenv";
-import serverless from "serverless-http";
 
-dotenv.config();
-
+// ✅ Fix des sauts de ligne de la clé privée Firebase
 const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n");
 
+// 🔥 Initialisation Firebase Admin (évite les doublons en hot reload)
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert({
@@ -19,43 +16,76 @@ if (!admin.apps.length) {
 }
 const db = admin.firestore();
 
+// ⚡ Stripe
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2023-10-16",
 });
 
-const app = express();
-
-// ⚠️ JSON parser sauf pour /api/webhook
-app.use((req, res, next) => {
-  if (req.originalUrl === "/api/webhook") {
-    next();
-  } else {
-    express.json()(req, res, next);
-  }
-});
-
+// -----------------------------
+// Map PriceID → Role
+// -----------------------------
 const PLAN = {
   "price_1Rt7ErFD9N3apMZl5ZJra4sW": "community",
   "price_1Rt7ILFD9N3apMZlt1kpm4Lx": "biz",
   "price_1RtmDdFD9N3apMZlul64n316": "community",
   "price_1RtmDpFD9N3apMZl6QpQyaQt": "biz",
+
+  // LIVE → mets tes vrais IDs Stripe
   "price_live_xxx": "community",
   "price_live_yyy": "biz",
 };
 
+// Fallback par montant (au cas où)
 const PLAN_BY_AMOUNT = {
-  1000: "community",
-  3500: "biz",
+  1000: "community", // 10€
+  3500: "biz",       // 35€
 };
 
-// Fonction asynchrone qui traite les events (après la réponse à Stripe)
-async function handleStripeEvent(event) {
+// -----------------------------
+// Config Vercel
+// -----------------------------
+export const config = {
+  api: {
+    bodyParser: false, // ⚠️ Stripe veut le raw body
+  },
+};
+
+// -----------------------------
+// Webhook Stripe
+// -----------------------------
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).send("Method Not Allowed");
+  }
+
+  const sig = req.headers["stripe-signature"];
+  let event;
+
+  try {
+    // ⚡ Construire l’event Stripe depuis le raw body
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error("⚠️ Webhook error:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // ---------------------------
+  // Gestion des paiements réussis
+  // ---------------------------
   if (event.type === "checkout.session.completed" || event.type === "invoice.paid") {
     const session = event.data.object;
-    const customerEmail = session?.customer_details?.email || session?.customer_email;
+
+    // ✅ Récup email
+    const customerEmail =
+      session?.customer_details?.email || session?.customer_email;
 
     let priceId = null;
 
+    // 🔎 1. On essaie de récupérer le PriceID directement
     try {
       const lineItems = await stripe.checkout.sessions.listLineItems(session.id, { limit: 1 });
       priceId = lineItems.data[0]?.price?.id || null;
@@ -63,6 +93,7 @@ async function handleStripeEvent(event) {
       console.error("❌ Impossible de récupérer les line_items:", err);
     }
 
+    // 🔎 2. Sinon on tente via l’abonnement
     if (!priceId && session?.subscription) {
       try {
         const subscription = await stripe.subscriptions.retrieve(session.subscription);
@@ -72,6 +103,7 @@ async function handleStripeEvent(event) {
       }
     }
 
+    // 🔎 3. Fallback par montant payé
     const amountCents =
       session.amount_total ||
       session.total ||
@@ -79,19 +111,19 @@ async function handleStripeEvent(event) {
       session.amount_due ||
       null;
 
-    let role = "member";
+    // 🎯 Détermination du rôle
+    let role = "member"; // défaut
     if (priceId && PLAN[priceId]) {
       role = PLAN[priceId];
     } else if (amountCents && PLAN_BY_AMOUNT[amountCents]) {
       role = PLAN_BY_AMOUNT[amountCents];
     }
 
-    console.log(`📦 Event Stripe: ${event.type} | email=${customerEmail} | priceId=${priceId} | role=${role}`);
+    console.log(`📦 Event reçu: ${event.type} | email=${customerEmail} | priceId=${priceId} | role=${role}`);
 
-    try {
-      if (!customerEmail) {
-        console.warn("❌ Email introuvable dans la session Stripe");
-      } else {
+    // ✅ Mise à jour Firestore
+    if (customerEmail) {
+      try {
         const snapshot = await db.collection("users").where("email", "==", customerEmail).get();
 
         if (!snapshot.empty) {
@@ -101,46 +133,12 @@ async function handleStripeEvent(event) {
         } else {
           console.warn(`❌ Firestore: utilisateur non trouvé (${customerEmail})`);
         }
+      } catch (err) {
+        console.error("🔥 Erreur Firestore:", err);
       }
-    } catch (err) {
-      console.error("🔥 Erreur Firestore:", err);
     }
-  } else {
-    console.log(`Unhandled event type: ${event.type}`);
   }
+
+  // ⚡ Toujours répondre à Stripe
+  res.status(200).json({ received: true });
 }
-
-app.post(
-  "/api/webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    const sig = req.headers["stripe-signature"];
-    let event;
-
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        process.env.STRIPE_WEBHOOK_SECRET
-      );
-    } catch (err) {
-      console.error("⚠️ Webhook error:", err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-
-    // ⚡ Réponse immédiate à Stripe
-    res.status(200).json({ received: true });
-
-    // 👇 Traitement asynchrone
-    handleStripeEvent(event);
-  }
-);
-
-// 👉 Export compatible Vercel
-export const config = {
-  api: {
-    bodyParser: false, // Stripe raw body obligatoire
-  },
-};
-
-export default serverless(app);
