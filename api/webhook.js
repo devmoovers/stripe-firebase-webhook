@@ -6,7 +6,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 // ⚡️ Fix des "\n" dans la clé privée Firebase
-const privateKey = process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n");
+const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n");
 
 // 🔥 Initialisation Firebase Admin
 if (!admin.apps.length) {
@@ -27,25 +27,33 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 
 const app = express();
 
+// ⚠️ Middleware JSON sauf pour /api/webhook
+app.use((req, res, next) => {
+  if (req.originalUrl === "/api/webhook") {
+    next();
+  } else {
+    express.json()(req, res, next);
+  }
+});
+
 // -----------------------------
 // Map PriceID → Role
 // -----------------------------
 const PLAN = {
-  // TEST
-  "price_1Rt7ErFD9N3apMZl5ZJra4sW": "community", // 10€
-  "price_1Rt7ILFD9N3apMZlt1kpm4Lx": "biz",       // 35€
-  "price_1RtmDdFD9N3apMZlul64n316": "community", // autre test
-  "price_1RtmDpFD9N3apMZl6QpQyaQt": "biz",       // autre test
+  "price_1Rt7ErFD9N3apMZl5ZJra4sW": "community",
+  "price_1Rt7ILFD9N3apMZlt1kpm4Lx": "biz",
+  "price_1RtmDdFD9N3apMZlul64n316": "community",
+  "price_1RtmDpFD9N3apMZl6QpQyaQt": "biz",
 
-  // LIVE (à compléter avec tes vrais IDs)
-  "price_live_xxx": "community", 
+  // LIVE
+  "price_live_xxx": "community",
   "price_live_yyy": "biz",
 };
 
-// Fallback montant (en centimes)
+// Fallback montant
 const PLAN_BY_AMOUNT = {
-  1000: "community", // 10 €
-  3500: "biz",       // 35 €
+  1000: "community",
+  3500: "biz",
 };
 
 // -----------------------------
@@ -69,29 +77,41 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // 👉 On gère uniquement les paiements réussis
-    if (event.type === "checkout.session.completed" || event.type === "invoice.paid") {
+    if (
+      event.type === "checkout.session.completed" ||
+      event.type === "invoice.paid"
+    ) {
       const session = event.data.object;
 
       const customerEmail =
         session?.customer_details?.email || session?.customer_email;
 
-      // On récupère l’abonnement via PriceID
-      const lineItems = session.display_items || session.line_items || [];
       let priceId = null;
 
-      if (lineItems?.[0]?.price?.id) {
-        priceId = lineItems[0].price.id;
-      } else if (session?.subscription) {
+      // 1. Line items
+      try {
+        const lineItems = await stripe.checkout.sessions.listLineItems(
+          session.id,
+          { limit: 1 }
+        );
+        priceId = lineItems.data[0]?.price?.id || null;
+      } catch (err) {
+        console.error("❌ Impossible de récupérer les line_items:", err);
+      }
+
+      // 2. Subscription fallback
+      if (!priceId && session?.subscription) {
         try {
-          const subscription = await stripe.subscriptions.retrieve(session.subscription);
-          priceId = subscription.items.data[0].price.id;
+          const subscription = await stripe.subscriptions.retrieve(
+            session.subscription
+          );
+          priceId = subscription.items.data[0]?.price.id || null;
         } catch (err) {
           console.error("❌ Impossible de récupérer la subscription:", err);
         }
       }
 
-      // Fallback via montant
+      // 3. Montant fallback
       const amountCents =
         session.amount_total ||
         session.total ||
@@ -99,17 +119,20 @@ app.post(
         session.amount_due ||
         null;
 
-      // Détermination du rôle
-      let role = "member"; // valeur par défaut
+      let role = "member";
       if (priceId && PLAN[priceId]) {
         role = PLAN[priceId];
       } else if (amountCents && PLAN_BY_AMOUNT[amountCents]) {
         role = PLAN_BY_AMOUNT[amountCents];
       }
 
+      console.log(
+        `📦 Event Stripe: ${event.type} | email=${customerEmail} | priceId=${priceId} | role=${role}`
+      );
+
       try {
         if (!customerEmail) {
-          console.log("❌ Email introuvable dans la session Stripe");
+          console.warn("❌ Email introuvable dans la session Stripe");
         } else {
           const snapshot = await db
             .collection("users")
@@ -119,9 +142,9 @@ app.post(
           if (!snapshot.empty) {
             const userDoc = snapshot.docs[0];
             await userDoc.ref.update({ role });
-            console.log(`✅ Rôle '${role}' mis à jour pour ${customerEmail}`);
+            console.log(`✅ Firestore: rôle '${role}' mis à jour pour ${customerEmail}`);
           } else {
-            console.log(`❌ Utilisateur non trouvé : ${customerEmail}`);
+            console.warn(`❌ Firestore: utilisateur non trouvé (${customerEmail})`);
           }
         }
       } catch (err) {
@@ -129,7 +152,7 @@ app.post(
       }
     }
 
-    res.json({ received: true });
+    res.status(200).json({ received: true });
   }
 );
 
