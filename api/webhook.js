@@ -29,10 +29,6 @@ const PLAN = {
   "price_1Rt7ILFD9N3apMZlt1kpm4Lx": "biz",
   "price_1RtmDdFD9N3apMZlul64n316": "community",
   "price_1RtmDpFD9N3apMZl6QpQyaQt": "biz",
-
-  // LIVE → mets tes vrais IDs Stripe
-  "price_live_xxx": "community",
-  "price_live_yyy": "biz",
 };
 
 // Fallback par montant (au cas où)
@@ -42,32 +38,53 @@ const PLAN_BY_AMOUNT = {
 };
 
 // -----------------------------
-// Config Vercel
+// Configuration Vercel - Version 2
 // -----------------------------
 export const config = {
   api: {
-    bodyParser: false, // ⚠️ Stripe veut le raw body
+    bodyParser: {
+      sizeLimit: '1mb',
+    },
   },
 };
 
 // -----------------------------
-// Webhook Stripe
+// Webhook Stripe - Version Alternative
 // -----------------------------
 export default async function handler(req, res) {
   if (req.method !== "POST") {
+    console.log("❌ Method not allowed:", req.method);
     return res.status(405).send("Method Not Allowed");
   }
 
+  console.log("📨 Webhook reçu");
+
   const sig = req.headers["stripe-signature"];
+  if (!sig) {
+    console.log("❌ Signature manquante");
+    return res.status(400).send("No signature header");
+  }
+
   let event;
 
   try {
-    // ⚡ Construire l’event Stripe depuis le raw body
+    // 📖 Utiliser req.body directement (si bodyParser est activé)
+    let body = req.body;
+    
+    // Si c'est un objet, le reconvertir en string
+    if (typeof body === 'object') {
+      body = JSON.stringify(body);
+    }
+    
+    console.log("📦 Body type:", typeof body, "length:", body.length);
+
+    // ⚡ Construire l'event Stripe
     event = stripe.webhooks.constructEvent(
-      req.body,
+      body,
       sig,
       process.env.STRIPE_WEBHOOK_SECRET
     );
+    console.log("✅ Event validé:", event.type);
   } catch (err) {
     console.error("⚠️ Webhook error:", err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
@@ -78,67 +95,100 @@ export default async function handler(req, res) {
   // ---------------------------
   if (event.type === "checkout.session.completed" || event.type === "invoice.paid") {
     const session = event.data.object;
+    console.log("💳 Session:", {
+      id: session.id,
+      customer: session.customer,
+      subscription: session.subscription,
+      amount_total: session.amount_total
+    });
 
-    // ✅ Récup email
-    const customerEmail =
-      session?.customer_details?.email || session?.customer_email;
+    // ✅ Récup email - plus robuste
+    const customerEmail = 
+      session?.customer_details?.email || 
+      session?.customer_email;
+
+    if (!customerEmail) {
+      console.warn("❌ Pas d'email trouvé dans la session");
+      return res.status(200).json({ received: true, warning: "No email found" });
+    }
 
     let priceId = null;
 
-    // 🔎 1. On essaie de récupérer le PriceID directement
+    // 🔎 1. Essayer de récupérer le PriceID via lineItems
     try {
-      const lineItems = await stripe.checkout.sessions.listLineItems(session.id, { limit: 1 });
-      priceId = lineItems.data[0]?.price?.id || null;
-    } catch (err) {
-      console.error("❌ Impossible de récupérer les line_items:", err);
-    }
-
-    // 🔎 2. Sinon on tente via l’abonnement
-    if (!priceId && session?.subscription) {
-      try {
+      if (session.mode === "subscription" || session.subscription) {
+        // Pour les abonnements
         const subscription = await stripe.subscriptions.retrieve(session.subscription);
-        priceId = subscription.items.data[0]?.price.id || null;
-      } catch (err) {
-        console.error("❌ Impossible de récupérer la subscription:", err);
+        priceId = subscription.items.data[0]?.price.id;
+        console.log("💡 PriceID depuis subscription:", priceId);
+      } else {
+        // Pour les paiements uniques
+        const lineItems = await stripe.checkout.sessions.listLineItems(session.id, { limit: 1 });
+        priceId = lineItems.data[0]?.price?.id;
+        console.log("💡 PriceID depuis lineItems:", priceId);
       }
+    } catch (err) {
+      console.error("❌ Erreur récupération priceId:", err.message);
     }
 
-    // 🔎 3. Fallback par montant payé
-    const amountCents =
-      session.amount_total ||
-      session.total ||
-      session.amount_paid ||
-      session.amount_due ||
-      null;
+    // 🔎 2. Fallback par montant payé
+    const amountCents = session.amount_total || session.total || 0;
+    console.log("💰 Montant:", amountCents);
 
     // 🎯 Détermination du rôle
     let role = "member"; // défaut
     if (priceId && PLAN[priceId]) {
       role = PLAN[priceId];
+      console.log(`🎯 Rôle depuis priceId: ${role}`);
     } else if (amountCents && PLAN_BY_AMOUNT[amountCents]) {
       role = PLAN_BY_AMOUNT[amountCents];
+      console.log(`🎯 Rôle depuis montant: ${role}`);
+    } else {
+      console.warn(`❓ Pas de rôle trouvé pour priceId=${priceId}, montant=${amountCents}`);
     }
 
-    console.log(`📦 Event reçu: ${event.type} | email=${customerEmail} | priceId=${priceId} | role=${role}`);
+    console.log(`📦 Traitement: email=${customerEmail} | priceId=${priceId} | role=${role}`);
 
     // ✅ Mise à jour Firestore
-    if (customerEmail) {
-      try {
-        const snapshot = await db.collection("users").where("email", "==", customerEmail).get();
+    try {
+      const snapshot = await db.collection("users").where("email", "==", customerEmail).get();
 
-        if (!snapshot.empty) {
-          const userDoc = snapshot.docs[0];
-          await userDoc.ref.update({ role });
-          console.log(`✅ Firestore: rôle '${role}' mis à jour pour ${customerEmail}`);
-        } else {
-          console.warn(`❌ Firestore: utilisateur non trouvé (${customerEmail})`);
-        }
-      } catch (err) {
-        console.error("🔥 Erreur Firestore:", err);
+      if (!snapshot.empty) {
+        const userDoc = snapshot.docs[0];
+        const currentData = userDoc.data();
+        
+        await userDoc.ref.update({ 
+          role,
+          lastPayment: admin.firestore.FieldValue.serverTimestamp(),
+          stripeCustomerId: session.customer,
+          subscriptionId: session.subscription || null
+        });
+        
+        console.log(`✅ Firestore: rôle '${role}' mis à jour pour ${customerEmail}`);
+        console.log(`📊 Données avant:`, currentData);
+      } else {
+        console.warn(`❌ Firestore: utilisateur non trouvé (${customerEmail})`);
+        // Option: créer l'utilisateur automatiquement
+        /*
+        await db.collection("users").add({
+          email: customerEmail,
+          role,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          stripeCustomerId: session.customer,
+          subscriptionId: session.subscription || null
+        });
+        console.log(`✅ Utilisateur créé: ${customerEmail} avec rôle ${role}`);
+        */
       }
+    } catch (err) {
+      console.error("🔥 Erreur Firestore:", err);
+      return res.status(500).json({ error: "Database error", received: true });
     }
+  } else {
+    console.log(`ℹ️ Event non traité: ${event.type}`);
   }
 
   // ⚡ Toujours répondre à Stripe
-  res.status(200).json({ received: true });
+  console.log("✅ Webhook traité avec succès");
+  res.status(200).json({ received: true, eventType: event.type });
 }
