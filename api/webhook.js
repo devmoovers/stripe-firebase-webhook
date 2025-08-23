@@ -21,6 +21,12 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2023-10-16",
 });
 
+// 🔐 Essayer les deux webhook secrets (TEST et LIVE)
+const webhookSecrets = [
+  process.env.STRIPE_WEBHOOK_SECRET,      // LIVE
+  process.env.STRIPE_WEBHOOK_SECRET_TEST  // TEST
+].filter(Boolean); // Enlève les valeurs vides/undefined
+
 // -----------------------------
 // Map PriceID → Role
 // -----------------------------
@@ -38,18 +44,28 @@ const PLAN_BY_AMOUNT = {
 };
 
 // -----------------------------
-// Configuration Vercel - Version 2
+// Configuration Vercel CRITIQUE
 // -----------------------------
 export const config = {
   api: {
-    bodyParser: {
-      sizeLimit: '1mb',
-    },
+    bodyParser: false, // ⚠️ OBLIGATOIRE : désactiver pour avoir le raw body
   },
 };
 
 // -----------------------------
-// Webhook Stripe - Version Alternative
+// Fonction pour lire le raw body
+// -----------------------------
+const getRawBody = (req) => {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+};
+
+// -----------------------------
+// Webhook Stripe FINAL
 // -----------------------------
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -58,6 +74,7 @@ export default async function handler(req, res) {
   }
 
   console.log("📨 Webhook reçu");
+  console.log("🔍 Headers:", JSON.stringify(req.headers, null, 2));
 
   const sig = req.headers["stripe-signature"];
   if (!sig) {
@@ -66,24 +83,31 @@ export default async function handler(req, res) {
   }
 
   let event;
+  let body;
 
   try {
-    // 📖 Utiliser req.body directement (si bodyParser est activé)
-    let body = req.body;
-    
-    // Si c'est un objet, le reconvertir en string
-    if (typeof body === 'object') {
-      body = JSON.stringify(body);
-    }
-    
-    console.log("📦 Body type:", typeof body, "length:", body.length);
+    // 📖 Lire le raw body
+    body = await getRawBody(req);
+    console.log("📦 Body reçu, taille:", body.length);
 
-    // ⚡ Construire l'event Stripe
-    event = stripe.webhooks.constructEvent(
-      body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
+    // 🔐 Essayer avec chaque webhook secret
+    let eventConstructed = false;
+    for (const secret of webhookSecrets) {
+      try {
+        event = stripe.webhooks.constructEvent(body, sig, secret);
+        console.log("✅ Event validé avec secret:", secret.substring(0, 12) + "...");
+        eventConstructed = true;
+        break; // Succès, on s'arrête
+      } catch (err) {
+        console.log("❌ Échec avec secret:", secret.substring(0, 12) + "...", err.message);
+        continue; // Essayer le prochain secret
+      }
+    }
+
+    if (!eventConstructed) {
+      throw new Error("Aucun webhook secret ne fonctionne");
+    }
+
     console.log("✅ Event validé:", event.type);
   } catch (err) {
     console.error("⚠️ Webhook error:", err.message);
@@ -99,7 +123,8 @@ export default async function handler(req, res) {
       id: session.id,
       customer: session.customer,
       subscription: session.subscription,
-      amount_total: session.amount_total
+      amount_total: session.amount_total,
+      mode: session.mode
     });
 
     // ✅ Récup email - plus robuste
@@ -165,7 +190,7 @@ export default async function handler(req, res) {
         });
         
         console.log(`✅ Firestore: rôle '${role}' mis à jour pour ${customerEmail}`);
-        console.log(`📊 Données avant !`, currentData);
+        console.log(`📊 Données avant:`, JSON.stringify(currentData, null, 2));
       } else {
         console.warn(`❌ Firestore: utilisateur non trouvé (${customerEmail})`);
         // Option: créer l'utilisateur automatiquement
