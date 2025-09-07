@@ -1,10 +1,9 @@
 import Stripe from "stripe";
 import admin from "firebase-admin";
 
-// ✅ Fix des sauts de ligne de la clé privée Firebase
 const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n");
 
-// 🔥 Initialisation Firebase Admin (évite les doublons en hot reload)
+// 🔥 Init Firebase Admin
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert({
@@ -21,14 +20,14 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2023-10-16",
 });
 
-// 🔐 Essayer les deux webhook secrets (TEST et LIVE)
+// 🔐 Webhook secrets (TEST + PROD)
 const webhookSecrets = [
-  process.env.STRIPE_WEBHOOK_SECRET,      // LIVE
-  process.env.STRIPE_WEBHOOK_SECRET_TEST  // TEST
-].filter(Boolean); // Enlève les valeurs vides/undefined
+  process.env.STRIPE_WEBHOOK_SECRET,
+  process.env.STRIPE_WEBHOOK_SECRET_TEST,
+].filter(Boolean);
 
 // -----------------------------
-// Map PriceID → Role
+// Plans Stripe → rôles Firestore
 // -----------------------------
 const PLAN = {
   "price_1Rt7ErFD9N3apMZl5ZJra4sW": "community",
@@ -37,48 +36,43 @@ const PLAN = {
   "price_1RtmDpFD9N3apMZl6QpQyaQt": "biz",
 };
 
-// Fallback par montant (au cas où)
+// Fallback par montant (€ → role)
 const PLAN_BY_AMOUNT = {
-  1000: "community", // 10€
-  3500: "biz",       // 35€
+  1000: "community", // 10 €
+  3500: "biz",       // 35 €
 };
 
 // -----------------------------
-// Configuration Vercel CRITIQUE
+// Config API (Vercel)
 // -----------------------------
 export const config = {
   api: {
-    bodyParser: false, // ⚠️ OBLIGATOIRE : désactiver pour avoir le raw body
+    bodyParser: false,
   },
 };
 
 // -----------------------------
-// Fonction pour lire le raw body
+// Raw body helper
 // -----------------------------
 const getRawBody = (req) => {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', (chunk) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
   });
 };
 
 // -----------------------------
-// Webhook Stripe FINAL
+// Webhook Stripe
 // -----------------------------
 export default async function handler(req, res) {
   if (req.method !== "POST") {
-    console.log("❌ Method not allowed:", req.method);
     return res.status(405).send("Method Not Allowed");
   }
 
-  console.log("📨 Webhook reçu");
-  console.log("🔍 Headers:", JSON.stringify(req.headers, null, 2));
-
   const sig = req.headers["stripe-signature"];
   if (!sig) {
-    console.log("❌ Signature manquante");
     return res.status(400).send("No signature header");
   }
 
@@ -86,134 +80,154 @@ export default async function handler(req, res) {
   let body;
 
   try {
-    // 📖 Lire le raw body
     body = await getRawBody(req);
-    console.log("📦 Body reçu, taille:", body.length);
 
-    // 🔐 Essayer avec chaque webhook secret
     let eventConstructed = false;
     for (const secret of webhookSecrets) {
       try {
         event = stripe.webhooks.constructEvent(body, sig, secret);
-        console.log("✅ Event validé avec secret:", secret.substring(0, 12) + "...");
         eventConstructed = true;
-        break; // Succès, on s'arrête
-      } catch (err) {
-        console.log("❌ Échec avec secret:", secret.substring(0, 12) + "...", err.message);
-        continue; // Essayer le prochain secret
+        break;
+      } catch {
+        continue;
       }
     }
 
-    if (!eventConstructed) {
-      throw new Error("Aucun webhook secret ne fonctionne");
-    }
-
-    console.log("✅ Event validé:", event.type);
+    if (!eventConstructed) throw new Error("Webhook secret invalide");
   } catch (err) {
-    console.error("⚠️ Webhook error:", err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
   // ---------------------------
-  // Gestion des paiements réussis
+  // Paiements réussis
   // ---------------------------
   if (event.type === "checkout.session.completed" || event.type === "invoice.paid") {
     const session = event.data.object;
-    console.log("💳 Session:", {
-      id: session.id,
-      customer: session.customer,
-      subscription: session.subscription,
-      amount_total: session.amount_total,
-      mode: session.mode
-    });
 
-    // ✅ Récup email - plus robuste
-    const customerEmail = 
-      session?.customer_details?.email || 
-      session?.customer_email;
-
+    const customerEmail =
+      session?.customer_details?.email || session?.customer_email;
     if (!customerEmail) {
-      console.warn("❌ Pas d'email trouvé dans la session");
       return res.status(200).json({ received: true, warning: "No email found" });
     }
 
+    // 🔎 Récup PriceID
     let priceId = null;
-
-    // 🔎 1. Essayer de récupérer le PriceID via lineItems
     try {
       if (session.mode === "subscription" || session.subscription) {
-        // Pour les abonnements
         const subscription = await stripe.subscriptions.retrieve(session.subscription);
         priceId = subscription.items.data[0]?.price.id;
-        console.log("💡 PriceID depuis subscription:", priceId);
       } else {
-        // Pour les paiements uniques
         const lineItems = await stripe.checkout.sessions.listLineItems(session.id, { limit: 1 });
         priceId = lineItems.data[0]?.price?.id;
-        console.log("💡 PriceID depuis lineItems:", priceId);
       }
     } catch (err) {
       console.error("❌ Erreur récupération priceId:", err.message);
     }
 
-    // 🔎 2. Fallback par montant payé
     const amountCents = session.amount_total || session.total || 0;
-    console.log("💰 Montant:", amountCents);
 
     // 🎯 Détermination du rôle
-    let role = "member"; // défaut
-    if (priceId && PLAN[priceId]) {
-      role = PLAN[priceId];
-      console.log(`🎯 Rôle depuis priceId: ${role}`);
-    } else if (amountCents && PLAN_BY_AMOUNT[amountCents]) {
-      role = PLAN_BY_AMOUNT[amountCents];
-      console.log(`🎯 Rôle depuis montant: ${role}`);
-    } else {
-      console.warn(`❓ Pas de rôle trouvé pour priceId=${priceId}, montant=${amountCents}`);
-    }
+    let role = "member";
+    if (priceId && PLAN[priceId]) role = PLAN[priceId];
+    else if (amountCents && PLAN_BY_AMOUNT[amountCents]) role = PLAN_BY_AMOUNT[amountCents];
 
-    console.log(`📦 Traitement: email=${customerEmail} | priceId=${priceId} | role=${role}`);
-
-    // ✅ Mise à jour Firestore
     try {
       const snapshot = await db.collection("users").where("email", "==", customerEmail).get();
 
       if (!snapshot.empty) {
         const userDoc = snapshot.docs[0];
-        const currentData = userDoc.data();
-        
-        await userDoc.ref.update({ 
+        const userId = userDoc.id;
+
+        // ✅ Update Firestore de base
+        await userDoc.ref.update({
           role,
           lastPayment: admin.firestore.FieldValue.serverTimestamp(),
           stripeCustomerId: session.customer,
-          subscriptionId: session.subscription || null
+          subscriptionId: session.subscription || null,
         });
-        
-        console.log(`✅ Firestore: rôle '${role}' mis à jour pour ${customerEmail}`);
-        console.log(`📊 Données avant:`, JSON.stringify(currentData, null, 2));
-      } else {
-        console.warn(`❌ Firestore: utilisateur non trouvé (${customerEmail})`);
-        // Option: créer l'utilisateur automatiquement
-        /*
-        await db.collection("users").add({
-          email: customerEmail,
-          role,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          stripeCustomerId: session.customer,
-          subscriptionId: session.subscription || null
-        });
-        console.log(`✅ Utilisateur créé: ${customerEmail} avec rôle ${role}`);
-        */
+
+        // -----------------------------
+        // Gestion du parrainage
+        // -----------------------------
+        const referralCodeUsed =
+          session.metadata?.referralCode ||
+          session.custom_fields?.find(f => f.key === "Code parrainage (optionnel)")?.text?.value;
+
+        if (referralCodeUsed) {
+          const refSnap = await db
+            .collection("users")
+            .where("referralCode", "==", referralCodeUsed)
+            .get();
+
+          if (!refSnap.empty) {
+            const parrainDoc = refSnap.docs[0];
+            const parrainData = parrainDoc.data();
+
+            const newCount = (parrainData.referralsCount || 0) + 1;
+            let freeMonths = parrainData.freeMonths || 0;
+
+            let monthGranted = false;
+            if (newCount % 2 === 0) {
+              freeMonths += 1;
+              monthGranted = true;
+            }
+
+            // ✅ Update parrain
+            await parrainDoc.ref.update({
+              referralsCount: newCount,
+              freeMonths,
+              lastReferral: admin.firestore.FieldValue.serverTimestamp(),
+              filleuls: admin.firestore.FieldValue.arrayUnion({
+                uid: userId,
+                email: customerEmail,
+                subscribedAt: new Date().toISOString(),
+              }),
+            });
+
+            // ✅ Update filleul
+            await userDoc.ref.update({
+              referredBy: parrainDoc.id,
+              referralCodeUsed,
+            });
+
+            // 🚀 Appliquer mois offert dans Stripe
+            if (monthGranted && parrainData.subscriptionId) {
+              try {
+                // Vérifier si coupon existe
+                let coupon = null;
+                const coupons = await stripe.coupons.list({ limit: 100 });
+                coupon = coupons.data.find((c) => c.name === "1 mois offert");
+
+                if (!coupon) {
+                  coupon = await stripe.coupons.create({
+                    percent_off: 100,
+                    duration: "once",
+                    name: "1 mois offert",
+                  });
+                }
+
+                // Vérifier que le parrain n’a pas déjà un coupon actif
+                const sub = await stripe.subscriptions.retrieve(parrainData.subscriptionId);
+                if (!sub.discount) {
+                  await stripe.subscriptions.update(parrainData.subscriptionId, {
+                    coupon: coupon.id,
+                  });
+                  console.log(`🎉 Mois offert appliqué au parrain ${parrainData.email}`);
+                } else {
+                  console.log(`ℹ️ Parrain ${parrainData.email} a déjà un coupon actif, on n’en ajoute pas.`);
+                }
+              } catch (err) {
+                console.error("🔥 Erreur application mois offert:", err);
+              }
+            }
+          }
+        }
       }
     } catch (err) {
       console.error("🔥 Erreur Firestore:", err);
       return res.status(500).json({ error: "Database error", received: true });
     }
-  } else {
-    console.log(`ℹ️ Event non traité: ${event.type}`);
   }
 
-  // ⚡ Toujours répondre à Stripe
-  console.log("✅ Webhook traité avec succès");
   res.status(200).json({ received: true, eventType: event.type });
 }
