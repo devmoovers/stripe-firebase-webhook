@@ -27,7 +27,10 @@ const stripeTest = process.env.STRIPE_SECRET_KEY_TEST
 /* -----------------------------
    🔐 Webhook secrets
 ----------------------------- */
-const webhookSecrets = [process.env.STRIPE_WEBHOOK_SECRET, process.env.STRIPE_WEBHOOK_SECRET_TEST].filter(Boolean);
+const webhookSecrets = [
+  process.env.STRIPE_WEBHOOK_SECRET,
+  process.env.STRIPE_WEBHOOK_SECRET_TEST,
+].filter(Boolean);
 
 /* -----------------------------
    Plans Stripe → rôles Firestore
@@ -46,14 +49,14 @@ const PLAN_BY_AMOUNT = { 1000: "community", 3500: "biz" };
 const LEMLIST_API_KEY = process.env.LEMLIST_API_KEY;
 const LEMLIST_API_URL = "https://api.lemlist.com/api";
 
-// Auth Lemlist en Basic (clé en username, mot de passe vide)
+// Auth Lemlist en Basic (username = clé, password vide)
 const lemlistHeaders = {
   Authorization: "Basic " + Buffer.from(`${LEMLIST_API_KEY}:`).toString("base64"),
   "Content-Type": "application/json",
 };
 
-// Debug → voir ce qui part (désactive en prod)
-console.log("🔑 Lemlist header (prefix):", lemlistHeaders.Authorization.substring(0, 25) + "...");
+// Debug pour vérifier que la clé est bien injectée
+console.log("🔑 Lemlist key loaded:", LEMLIST_API_KEY ? "✅ OK" : "❌ MISSING");
 
 /** Ajout (ou création implicite) d’un lead dans une campagne */
 async function addToCampaign(campaignId, email, firstName = "", lastName = "") {
