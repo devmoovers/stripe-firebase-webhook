@@ -52,6 +52,9 @@ const lemlistHeaders = {
   "Content-Type": "application/json",
 };
 
+// Debug → voir ce qui part (désactive en prod)
+console.log("🔑 Lemlist header (prefix):", lemlistHeaders.Authorization.substring(0, 25) + "...");
+
 /** Ajout (ou création implicite) d’un lead dans une campagne */
 async function addToCampaign(campaignId, email, firstName = "", lastName = "") {
   const url = `${LEMLIST_API_URL}/campaigns/${campaignId}/leads/${encodeURIComponent(
