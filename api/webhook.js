@@ -70,7 +70,7 @@ async function addToCampaign(campaignId, email, firstName = "", lastName = "") {
     body: JSON.stringify({
       firstName,
       lastName,
-      companyName: "Moovers",
+      companyName: "",
     }),
   });
 
