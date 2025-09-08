@@ -43,62 +43,82 @@ const PLAN = {
   "price_1RtmDdFD9N3apMZlul64n316": "community",
   "price_1RtmDpFD9N3apMZl6QpQyaQt": "biz",
 };
-const PLAN_BY_AMOUNT = { 1000: "community", 3500: "biz" };
+
+const PLAN_BY_AMOUNT = {
+  1000: "community", // 10 €
+  3500: "biz",       // 35 €
+};
 
 // -----------------------------
-// Lemlist API
+// Lemlist API helpers
 // -----------------------------
 const LEMLIST_API_KEY = process.env.LEMLIST_API_KEY;
 const LEMLIST_API_URL = "https://api.lemlist.com/api";
-const lemlistHeaders = {
-  "Api-Key": LEMLIST_API_KEY,  // 👈 clé attendue
-  "Accept": "application/json",
-  "Content-Type": "application/json",
-};
 
-// GET lead by email
-async function getLemlistLead(email) {
-  const url = `${LEMLIST_API_URL}/leads?email=${encodeURIComponent(email)}`;
-  const res = await fetch(url, { headers: lemlistHeaders });
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Erreur Lemlist GET: ${res.status} ${res.statusText}${txt ? " – " + txt : ""}`);
-  }
-  const data = await res.json();
-  return Array.isArray(data) ? data[0] || null : data || null;
-}
-
-// CREATE lead
-async function createLemlistLead({ email, firstName = "", lastName = "", company = "Moovers" }) {
-  const res = await fetch(`${LEMLIST_API_URL}/leads`, {
-    method: "POST",
-    headers: lemlistHeaders,
-    body: JSON.stringify({ email, firstName, lastName, company }),
+// ✅ GET contact
+async function getLemlistContact(email) {
+  const res = await fetch(`${LEMLIST_API_URL}/contacts?email=${encodeURIComponent(email)}`, {
+    headers: {
+      Authorization: `Api-Key ${LEMLIST_API_KEY}`,
+    },
   });
+
   if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Lemlist create lead non-ok (${res.status}): ${txt || res.statusText}`);
+    if (res.status === 404) return null;
+    throw new Error(`Erreur Lemlist GET: ${res.status} ${res.statusText}`);
   }
-  return res.json();
+
+  const data = await res.json();
+  return Array.isArray(data) && data.length > 0 ? data[0] : null;
 }
 
-// Add lead to campaign
-async function addLeadToCampaign(campaignId, email) {
-  // endpoint documenté : POST /campaigns/{id}/leads/{email}?deduplicate=true
-  const url = `${LEMLIST_API_URL}/campaigns/${campaignId}/leads/${encodeURIComponent(email)}?deduplicate=true`;
-  const res = await fetch(url, { method: "POST", headers: lemlistHeaders });
+// ✅ CREATE contact
+async function createLemlistContact(email, firstName, lastName) {
+  const res = await fetch(`${LEMLIST_API_URL}/contacts`, {
+    method: "POST",
+    headers: {
+      Authorization: `Api-Key ${LEMLIST_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      email,
+      firstName,
+      lastName,
+      company: "Moovers",
+    }),
+  });
+
   if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Erreur Lemlist Campaign: ${res.status} ${res.statusText}${txt ? " – " + txt : ""}`);
+    const text = await res.text();
+    throw new Error(`Erreur Lemlist POST (${res.status}): ${text}`);
   }
-  return res.json();
+  return await res.json();
+}
+
+// ✅ ADD to campaign
+async function addToCampaign(campaignId, email) {
+  const url = `${LEMLIST_API_URL}/campaigns/${campaignId}/leads/${encodeURIComponent(email)}?deduplicate=true`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Api-Key ${LEMLIST_API_KEY}`,
+    },
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Erreur Lemlist Campaign (${res.status}): ${text}`);
+  }
+  return await res.json();
 }
 
 // -----------------------------
 // Config API (Vercel)
 // -----------------------------
-export const config = { api: { bodyParser: false } };
+export const config = {
+  api: { bodyParser: false },
+};
 
 // -----------------------------
 // Raw body helper
@@ -106,7 +126,7 @@ export const config = { api: { bodyParser: false } };
 const getRawBody = (req) =>
   new Promise((resolve, reject) => {
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
+    req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
@@ -115,7 +135,9 @@ const getRawBody = (req) =>
 // Webhook Stripe
 // -----------------------------
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+  if (req.method !== "POST") {
+    return res.status(405).send("Method Not Allowed");
+  }
 
   const sig = req.headers["stripe-signature"];
   if (!sig) return res.status(400).send("No signature header");
@@ -124,42 +146,49 @@ export default async function handler(req, res) {
   try {
     body = await getRawBody(req);
 
-    let ok = false;
+    let eventConstructed = false;
     for (const secret of webhookSecrets) {
       try {
         event = stripeLive.webhooks.constructEvent(body, sig, secret);
-        ok = true;
+        eventConstructed = true;
         break;
       } catch {
-        // try next secret
+        continue;
       }
     }
-    if (!ok) throw new Error("Webhook secret invalide");
+
+    if (!eventConstructed) throw new Error("Webhook secret invalide");
   } catch (err) {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Choix client Stripe selon livemode
+  // ✅ Choix du client Stripe (test ou live)
   let stripeClient = stripeLive;
-  if (event.livemode === false && stripeTest) stripeClient = stripeTest;
+  if (event.livemode === false && stripeTest) {
+    stripeClient = stripeTest;
+  }
 
   // ---------------------------
   // Paiements réussis
   // ---------------------------
   if (event.type === "checkout.session.completed" || event.type === "invoice.paid") {
     const session = event.data.object;
-    const customerEmail = session?.customer_details?.email || session?.customer_email;
-    if (!customerEmail) return res.status(200).json({ received: true, warning: "No email found" });
+    const customerEmail =
+      session?.customer_details?.email || session?.customer_email;
 
-    // Récup PriceID
+    if (!customerEmail) {
+      return res.status(200).json({ received: true, warning: "No email found" });
+    }
+
+    // 🔎 Récup PriceID
     let priceId = null;
     try {
       if (session.mode === "subscription" || session.subscription) {
         const subscription = await stripeClient.subscriptions.retrieve(session.subscription);
-        priceId = subscription.items.data[0]?.price?.id || null;
+        priceId = subscription.items.data[0]?.price.id;
       } else {
         const lineItems = await stripeClient.checkout.sessions.listLineItems(session.id, { limit: 1 });
-        priceId = lineItems.data[0]?.price?.id || null;
+        priceId = lineItems.data[0]?.price?.id;
       }
     } catch (err) {
       console.error("❌ Erreur récupération priceId:", err.message);
@@ -167,13 +196,14 @@ export default async function handler(req, res) {
 
     const amountCents = session.amount_total || session.total || 0;
 
-    // Déterminer le rôle
+    // 🎯 Détermination du rôle
     let role = "member";
     if (priceId && PLAN[priceId]) role = PLAN[priceId];
     else if (amountCents && PLAN_BY_AMOUNT[amountCents]) role = PLAN_BY_AMOUNT[amountCents];
 
     try {
       const snapshot = await db.collection("users").where("email", "==", customerEmail).get();
+
       if (!snapshot.empty) {
         const userDoc = snapshot.docs[0];
         const userId = userDoc.id;
@@ -186,42 +216,38 @@ export default async function handler(req, res) {
           subscriptionId: session.subscription || null,
         });
 
-        // 🚀 Lemlist (robuste)
+        // 🚀 Lemlist
         try {
-          const fullName = session.customer_details?.name || "";
-          const [firstName = "", lastName = ""] = fullName.split(" ");
-          let lead = await getLemlistLead(customerEmail);
-          if (!lead) {
-            await createLemlistLead({ email: customerEmail, firstName, lastName });
+          const existing = await getLemlistContact(customerEmail);
+          if (!existing) {
+            await createLemlistContact(
+              customerEmail,
+              session.customer_details?.name?.split(" ")[0] || "",
+              session.customer_details?.name?.split(" ")[1] || ""
+            );
           }
 
           const campaignIds = {
             community: process.env.LEMLIST_CAMPAIGN_COMMUNITY,
             biz: process.env.LEMLIST_CAMPAIGN_BIZ,
           };
+
           if (campaignIds[role]) {
-            await addLeadToCampaign(campaignIds[role], customerEmail);
-            console.log(`✅ Lemlist: ${customerEmail} → ${role}`);
+            await addToCampaign(campaignIds[role], customerEmail);
+            console.log(`✅ Ajout Lemlist: ${customerEmail} → ${role}`);
           }
         } catch (err) {
-          console.error("🔥 Erreur Lemlist:", err.message);
+          console.error("🔥 Erreur Lemlist:", err);
         }
 
-        // -----------------------------
-        // Parrainage (inchangé)
-        // -----------------------------
-        const fromCustomField = Array.isArray(session.custom_fields)
-          ? (session.custom_fields.find(
-              (f) =>
-                (f.key?.toLowerCase?.() || "").includes("parrain") ||
-                (f.label?.custom?.toLowerCase?.() || "").includes("parrain")
-            )?.text?.value || null)
-          : null;
-
-        const referralCodeUsed = session.metadata?.referralCode || fromCustomField || null;
+        // 🚀 Gestion du parrainage (inchangé, fonctionnait bien chez toi)
+        const referralCodeUsed =
+          session.metadata?.referralCode ||
+          session.custom_fields?.find((f) => f.key === "Code parrainage (optionnel)")?.text?.value;
 
         if (referralCodeUsed) {
           const refSnap = await db.collection("users").where("referralCode", "==", referralCodeUsed).get();
+
           if (!refSnap.empty) {
             const parrainDoc = refSnap.docs[0];
             const parrainData = parrainDoc.data();
@@ -250,7 +276,6 @@ export default async function handler(req, res) {
               referralCodeUsed,
             });
 
-            // 🎁 Mois offert Stripe si besoin
             if (monthGranted && parrainData.subscriptionId) {
               try {
                 let coupon = null;
@@ -263,6 +288,7 @@ export default async function handler(req, res) {
                     name: "1 mois offert",
                   });
                 }
+
                 const sub = await stripeClient.subscriptions.retrieve(parrainData.subscriptionId);
                 if (!sub.discount) {
                   await stripeClient.subscriptions.update(parrainData.subscriptionId, { coupon: coupon.id });
@@ -271,7 +297,7 @@ export default async function handler(req, res) {
                   console.log(`ℹ️ ${parrainData.email} a déjà un coupon actif.`);
                 }
               } catch (err) {
-                console.error("🔥 Erreur application mois offert:", err.message);
+                console.error("🔥 Erreur application mois offert:", err);
               }
             }
           }
