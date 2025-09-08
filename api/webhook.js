@@ -22,7 +22,7 @@ const stripeTest = process.env.STRIPE_SECRET_KEY_TEST
   ? new Stripe(process.env.STRIPE_SECRET_KEY_TEST, { apiVersion: "2023-10-16" })
   : null;
 
-// 🔐 Webhook secrets (TEST + PROD)
+// 🔐 Webhook secrets
 const webhookSecrets = [
   process.env.STRIPE_WEBHOOK_SECRET,
   process.env.STRIPE_WEBHOOK_SECRET_TEST,
@@ -50,38 +50,42 @@ const PLAN_BY_AMOUNT = {
 const LEMLIST_API_KEY = process.env.LEMLIST_API_KEY;
 const LEMLIST_API_URL = "https://api.lemlist.com/api";
 
+// ✅ GET contact
 async function getLemlistContact(email) {
-  const res = await fetch(`${LEMLIST_API_URL}/contacts/${email}`, {
-    headers: { Authorization: `Bearer ${LEMLIST_API_KEY}` },
-  });
+  const res = await fetch(
+    `${LEMLIST_API_URL}/contacts/${encodeURIComponent(email)}`,
+    { headers: { Authorization: `Api-Key ${LEMLIST_API_KEY}` } }
+  );
   if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`Erreur Lemlist GET: ${res.statusText}`);
+  if (!res.ok) throw new Error(`Erreur Lemlist GET: ${res.status} ${res.statusText}`);
   return await res.json();
 }
 
+// ✅ CREATE contact
 async function createLemlistContact(email, firstName, lastName) {
   const res = await fetch(`${LEMLIST_API_URL}/contacts`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${LEMLIST_API_KEY}`,
+      Authorization: `Api-Key ${LEMLIST_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ email, firstName, lastName }),
   });
-  if (!res.ok) throw new Error(`Erreur Lemlist POST: ${res.statusText}`);
+  if (!res.ok) throw new Error(`Erreur Lemlist POST: ${res.status} ${res.statusText}`);
   return await res.json();
 }
 
+// ✅ ADD to campaign
 async function addToCampaign(campaignId, email) {
   const res = await fetch(`${LEMLIST_API_URL}/campaigns/${campaignId}/leads`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${LEMLIST_API_KEY}`,
+      Authorization: `Api-Key ${LEMLIST_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ email }),
+    body: JSON.stringify({ emails: [email] }), // ⚠️ tableau attendu
   });
-  if (!res.ok) throw new Error(`Erreur Lemlist Campaign: ${res.statusText}`);
+  if (!res.ok) throw new Error(`Erreur Lemlist Campaign: ${res.status} ${res.statusText}`);
   return await res.json();
 }
 
@@ -145,7 +149,8 @@ export default async function handler(req, res) {
   // ---------------------------
   if (event.type === "checkout.session.completed" || event.type === "invoice.paid") {
     const session = event.data.object;
-    const customerEmail = session?.customer_details?.email || session?.customer_email;
+    const customerEmail =
+      session?.customer_details?.email || session?.customer_email;
     if (!customerEmail) {
       return res.status(200).json({ received: true, warning: "No email found" });
     }
@@ -154,10 +159,15 @@ export default async function handler(req, res) {
     let priceId = null;
     try {
       if (session.mode === "subscription" || session.subscription) {
-        const subscription = await stripeClient.subscriptions.retrieve(session.subscription);
+        const subscription = await stripeClient.subscriptions.retrieve(
+          session.subscription
+        );
         priceId = subscription.items.data[0]?.price.id;
       } else {
-        const lineItems = await stripeClient.checkout.sessions.listLineItems(session.id, { limit: 1 });
+        const lineItems = await stripeClient.checkout.sessions.listLineItems(
+          session.id,
+          { limit: 1 }
+        );
         priceId = lineItems.data[0]?.price?.id;
       }
     } catch (err) {
@@ -169,10 +179,14 @@ export default async function handler(req, res) {
     // 🎯 Détermination du rôle
     let role = "member";
     if (priceId && PLAN[priceId]) role = PLAN[priceId];
-    else if (amountCents && PLAN_BY_AMOUNT[amountCents]) role = PLAN_BY_AMOUNT[amountCents];
+    else if (amountCents && PLAN_BY_AMOUNT[amountCents])
+      role = PLAN_BY_AMOUNT[amountCents];
 
     try {
-      const snapshot = await db.collection("users").where("email", "==", customerEmail).get();
+      const snapshot = await db
+        .collection("users")
+        .where("email", "==", customerEmail)
+        .get();
       if (!snapshot.empty) {
         const userDoc = snapshot.docs[0];
         const userId = userDoc.id;
@@ -214,10 +228,15 @@ export default async function handler(req, res) {
         // -----------------------------
         const referralCodeUsed =
           session.metadata?.referralCode ||
-          session.custom_fields?.find(f => f.key === "Code parrainage (optionnel)")?.text?.value;
+          session.custom_fields?.find(
+            (f) => f.key === "Code parrainage (optionnel)"
+          )?.text?.value;
 
         if (referralCodeUsed) {
-          const refSnap = await db.collection("users").where("referralCode", "==", referralCodeUsed).get();
+          const refSnap = await db
+            .collection("users")
+            .where("referralCode", "==", referralCodeUsed)
+            .get();
           if (!refSnap.empty) {
             const parrainDoc = refSnap.docs[0];
             const parrainData = parrainDoc.data();
@@ -251,7 +270,7 @@ export default async function handler(req, res) {
               try {
                 let coupon = null;
                 const coupons = await stripeClient.coupons.list({ limit: 100 });
-                coupon = coupons.data.find(c => c.name === "1 mois offert");
+                coupon = coupons.data.find((c) => c.name === "1 mois offert");
                 if (!coupon) {
                   coupon = await stripeClient.coupons.create({
                     percent_off: 100,
@@ -260,14 +279,21 @@ export default async function handler(req, res) {
                   });
                 }
 
-                const sub = await stripeClient.subscriptions.retrieve(parrainData.subscriptionId);
+                const sub = await stripeClient.subscriptions.retrieve(
+                  parrainData.subscriptionId
+                );
                 if (!sub.discount) {
-                  await stripeClient.subscriptions.update(parrainData.subscriptionId, {
-                    coupon: coupon.id,
-                  });
-                  console.log(`🎉 Mois offert appliqué à ${parrainData.email}`);
+                  await stripeClient.subscriptions.update(
+                    parrainData.subscriptionId,
+                    { coupon: coupon.id }
+                  );
+                  console.log(
+                    `🎉 Mois offert appliqué à ${parrainData.email}`
+                  );
                 } else {
-                  console.log(`ℹ️ ${parrainData.email} a déjà un coupon actif.`);
+                  console.log(
+                    `ℹ️ ${parrainData.email} a déjà un coupon actif.`
+                  );
                 }
               } catch (err) {
                 console.error("🔥 Erreur application mois offert:", err);
@@ -278,7 +304,9 @@ export default async function handler(req, res) {
       }
     } catch (err) {
       console.error("🔥 Erreur Firestore:", err);
-      return res.status(500).json({ error: "Database error", received: true });
+      return res
+        .status(500)
+        .json({ error: "Database error", received: true });
     }
   }
 
