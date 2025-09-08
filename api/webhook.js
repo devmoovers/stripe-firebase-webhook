@@ -1,5 +1,6 @@
 import Stripe from "stripe";
 import admin from "firebase-admin";
+import fetch from "node-fetch";
 
 const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n");
 
@@ -41,6 +42,56 @@ const PLAN_BY_AMOUNT = {
   1000: "community", // 10 €
   3500: "biz",       // 35 €
 };
+
+// -----------------------------
+// Lemlist API helpers
+// -----------------------------
+const LEMLIST_API_KEY = process.env.LEMLIST_API_KEY;
+const LEMLIST_API_URL = "https://api.lemlist.com/api";
+
+// Vérifie si un contact existe
+async function getLemlistContact(email) {
+  const res = await fetch(`${LEMLIST_API_URL}/contacts/${email}`, {
+    headers: {
+      Authorization: `Bearer ${LEMLIST_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Erreur Lemlist GET: ${res.statusText}`);
+  return await res.json();
+}
+
+// Crée un contact
+async function createLemlistContact(email, firstName, lastName) {
+  const res = await fetch(`${LEMLIST_API_URL}/contacts`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${LEMLIST_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ email, firstName, lastName }),
+  });
+
+  if (!res.ok) throw new Error(`Erreur Lemlist POST: ${res.statusText}`);
+  return await res.json();
+}
+
+// Ajoute un contact à une campagne
+async function addToCampaign(campaignId, email) {
+  const res = await fetch(`${LEMLIST_API_URL}/campaigns/${campaignId}/leads`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${LEMLIST_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ email }),
+  });
+
+  if (!res.ok) throw new Error(`Erreur Lemlist Campaign: ${res.statusText}`);
+  return await res.json();
+}
 
 // -----------------------------
 // Config API (Vercel)
@@ -147,6 +198,35 @@ export default async function handler(req, res) {
         });
 
         // -----------------------------
+        // 🚀 Lemlist: ajout dans la campagne
+        // -----------------------------
+        try {
+          const existing = await getLemlistContact(customerEmail);
+
+          if (!existing) {
+            await createLemlistContact(
+              customerEmail,
+              session.customer_details?.name?.split(" ")[0] || "",
+              session.customer_details?.name?.split(" ")[1] || ""
+            );
+          }
+
+          // Campagne par rôle
+          const campaignIds = {
+            community: process.env.LEMLIST_CAMPAIGN_COMMUNITY,
+            biz: process.env.LEMLIST_CAMPAIGN_BIZ,
+          };
+
+          const targetCampaign = campaignIds[role] || campaignIds.member;
+          if (targetCampaign) {
+            await addToCampaign(targetCampaign, customerEmail);
+            console.log(`✅ Ajout Lemlist: ${customerEmail} → ${role} (${targetCampaign})`);
+          }
+        } catch (err) {
+          console.error("🔥 Erreur Lemlist:", err);
+        }
+
+        // -----------------------------
         // Gestion du parrainage
         // -----------------------------
         const referralCodeUsed =
@@ -193,7 +273,6 @@ export default async function handler(req, res) {
             // 🚀 Appliquer mois offert dans Stripe
             if (monthGranted && parrainData.subscriptionId) {
               try {
-                // Vérifier si coupon existe
                 let coupon = null;
                 const coupons = await stripe.coupons.list({ limit: 100 });
                 coupon = coupons.data.find((c) => c.name === "1 mois offert");
@@ -206,7 +285,6 @@ export default async function handler(req, res) {
                   });
                 }
 
-                // Vérifier que le parrain n’a pas déjà un coupon actif
                 const sub = await stripe.subscriptions.retrieve(parrainData.subscriptionId);
                 if (!sub.discount) {
                   await stripe.subscriptions.update(parrainData.subscriptionId, {
@@ -214,7 +292,7 @@ export default async function handler(req, res) {
                   });
                   console.log(`🎉 Mois offert appliqué au parrain ${parrainData.email}`);
                 } else {
-                  console.log(`ℹ️ Parrain ${parrainData.email} a déjà un coupon actif, on n’en ajoute pas.`);
+                  console.log(`ℹ️ Parrain ${parrainData.email} a déjà un coupon actif.`);
                 }
               } catch (err) {
                 console.error("🔥 Erreur application mois offert:", err);
