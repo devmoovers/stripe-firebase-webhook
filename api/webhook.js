@@ -2,7 +2,9 @@ import Stripe from "stripe";
 import admin from "firebase-admin";
 import fetch from "node-fetch";
 
+// -----------------------------
 // 🔥 Init Firebase Admin
+// -----------------------------
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert({
@@ -14,7 +16,9 @@ if (!admin.apps.length) {
 }
 const db = admin.firestore();
 
+// -----------------------------
 // ⚡ Stripe (live + test)
+// -----------------------------
 const stripeLive = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2023-10-16",
 });
@@ -22,7 +26,9 @@ const stripeTest = process.env.STRIPE_SECRET_KEY_TEST
   ? new Stripe(process.env.STRIPE_SECRET_KEY_TEST, { apiVersion: "2023-10-16" })
   : null;
 
+// -----------------------------
 // 🔐 Webhook secrets
+// -----------------------------
 const webhookSecrets = [
   process.env.STRIPE_WEBHOOK_SECRET,
   process.env.STRIPE_WEBHOOK_SECRET_TEST,
@@ -38,7 +44,6 @@ const PLAN = {
   "price_1RtmDpFD9N3apMZl6QpQyaQt": "biz",
 };
 
-// Fallback par montant (€ → role)
 const PLAN_BY_AMOUNT = {
   1000: "community", // 10 €
   3500: "biz",       // 35 €
@@ -53,12 +58,17 @@ const LEMLIST_API_URL = "https://api.lemlist.com/api";
 // ✅ GET contact
 async function getLemlistContact(email) {
   const res = await fetch(
-    `${LEMLIST_API_URL}/contacts/${encodeURIComponent(email)}`,
+    `${LEMLIST_API_URL}/contacts?email=${encodeURIComponent(email)}`,
     { headers: { Authorization: `Api-Key ${LEMLIST_API_KEY}` } }
   );
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`Erreur Lemlist GET: ${res.status} ${res.statusText}`);
-  return await res.json();
+
+  if (!res.ok) {
+    if (res.status === 404) return null;
+    throw new Error(`Erreur Lemlist GET: ${res.status} ${res.statusText}`);
+  }
+
+  const data = await res.json();
+  return data?.[0] || null; // Lemlist renvoie un tableau
 }
 
 // ✅ CREATE contact
@@ -69,8 +79,14 @@ async function createLemlistContact(email, firstName, lastName) {
       Authorization: `Api-Key ${LEMLIST_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ email, firstName, lastName }),
+    body: JSON.stringify({
+      email,
+      firstName,
+      lastName,
+      company: "Moovers",
+    }),
   });
+
   if (!res.ok) throw new Error(`Erreur Lemlist POST: ${res.status} ${res.statusText}`);
   return await res.json();
 }
@@ -83,8 +99,9 @@ async function addToCampaign(campaignId, email) {
       Authorization: `Api-Key ${LEMLIST_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ emails: [email] }), // ⚠️ tableau attendu
+    body: JSON.stringify({ emails: [email] }),
   });
+
   if (!res.ok) throw new Error(`Erreur Lemlist Campaign: ${res.status} ${res.statusText}`);
   return await res.json();
 }
@@ -138,7 +155,7 @@ export default async function handler(req, res) {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Choix du client Stripe (test ou live)
+  // ✅ Choix du client Stripe (test ou live)
   let stripeClient = stripeLive;
   if (event.livemode === false && stripeTest) {
     stripeClient = stripeTest;
@@ -151,6 +168,7 @@ export default async function handler(req, res) {
     const session = event.data.object;
     const customerEmail =
       session?.customer_details?.email || session?.customer_email;
+
     if (!customerEmail) {
       return res.status(200).json({ received: true, warning: "No email found" });
     }
@@ -187,11 +205,12 @@ export default async function handler(req, res) {
         .collection("users")
         .where("email", "==", customerEmail)
         .get();
+
       if (!snapshot.empty) {
         const userDoc = snapshot.docs[0];
         const userId = userDoc.id;
 
-        // ✅ Update Firestore de base
+        // ✅ Update Firestore
         await userDoc.ref.update({
           role,
           lastPayment: admin.firestore.FieldValue.serverTimestamp(),
@@ -224,7 +243,7 @@ export default async function handler(req, res) {
         }
 
         // -----------------------------
-        // Gestion du parrainage
+        // Parrainage
         // -----------------------------
         const referralCodeUsed =
           session.metadata?.referralCode ||
@@ -237,6 +256,7 @@ export default async function handler(req, res) {
             .collection("users")
             .where("referralCode", "==", referralCodeUsed)
             .get();
+
           if (!refSnap.empty) {
             const parrainDoc = refSnap.docs[0];
             const parrainData = parrainDoc.data();
@@ -287,13 +307,9 @@ export default async function handler(req, res) {
                     parrainData.subscriptionId,
                     { coupon: coupon.id }
                   );
-                  console.log(
-                    `🎉 Mois offert appliqué à ${parrainData.email}`
-                  );
+                  console.log(`🎉 Mois offert appliqué à ${parrainData.email}`);
                 } else {
-                  console.log(
-                    `ℹ️ ${parrainData.email} a déjà un coupon actif.`
-                  );
+                  console.log(`ℹ️ ${parrainData.email} a déjà un coupon actif.`);
                 }
               } catch (err) {
                 console.error("🔥 Erreur application mois offert:", err);
