@@ -44,21 +44,21 @@ const PLAN = {
 const PLAN_BY_AMOUNT = { 1000: "community", 3500: "biz" };
 
 /* -----------------------------
-   Lemlist helpers (Api-Key header)
+   Lemlist helpers (Basic Auth CORRIGÉ)
 ----------------------------- */
 const LEMLIST_API_KEY = process.env.LEMLIST_API_KEY;
 const LEMLIST_API_URL = "https://api.lemlist.com/api";
 
-// Auth Lemlist → format attendu par leur API
+// Auth Lemlist CORRIGÉ : username VIDE (:), password = clé API
 const lemlistHeaders = {
-  Authorization: `Api-Key ${LEMLIST_API_KEY}`,
+  Authorization: "Basic " + Buffer.from(`:${LEMLIST_API_KEY}`).toString("base64"),
   "Content-Type": "application/json",
 };
 
 // Debug pour vérifier que la clé est bien injectée
 console.log("🔑 Lemlist key loaded:", LEMLIST_API_KEY ? "✅ OK" : "❌ MISSING");
 
-/** Ajout (ou création implicite) d’un lead dans une campagne */
+/** Ajout (ou création implicite) d'un lead dans une campagne */
 async function addToCampaign(campaignId, email, firstName = "", lastName = "") {
   const url = `${LEMLIST_API_URL}/campaigns/${campaignId}/leads/${encodeURIComponent(
     email
