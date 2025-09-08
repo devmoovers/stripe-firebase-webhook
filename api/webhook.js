@@ -68,7 +68,7 @@ async function getLemlistContact(email) {
   }
 
   const data = await res.json();
-  return data?.[0] || null; // Lemlist renvoie un tableau
+  return data?.[0] || null;
 }
 
 // ✅ CREATE contact
@@ -91,15 +91,16 @@ async function createLemlistContact(email, firstName, lastName) {
   return await res.json();
 }
 
-// ✅ ADD to campaign
+// ✅ ADD to campaign (fix doc officielle)
 async function addToCampaign(campaignId, email) {
-  const res = await fetch(`${LEMLIST_API_URL}/campaigns/${campaignId}/leads`, {
+  const url = `${LEMLIST_API_URL}/campaigns/${campaignId}/leads/${encodeURIComponent(email)}?deduplicate=true`;
+
+  const res = await fetch(url, {
     method: "POST",
     headers: {
       Authorization: `Api-Key ${LEMLIST_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ emails: [email] }),
   });
 
   if (!res.ok) throw new Error(`Erreur Lemlist Campaign: ${res.status} ${res.statusText}`);
