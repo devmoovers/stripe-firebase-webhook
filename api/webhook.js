@@ -27,7 +27,10 @@ const stripeTest = process.env.STRIPE_SECRET_KEY_TEST
 /* -----------------------------
    🔐 Webhook secrets
 ----------------------------- */
-const webhookSecrets = [process.env.STRIPE_WEBHOOK_SECRET, process.env.STRIPE_WEBHOOK_SECRET_TEST].filter(Boolean);
+const webhookSecrets = [
+  process.env.STRIPE_WEBHOOK_SECRET,
+  process.env.STRIPE_WEBHOOK_SECRET_TEST,
+].filter(Boolean);
 
 /* -----------------------------
    Plans Stripe → rôles Firestore
@@ -41,47 +44,28 @@ const PLAN = {
 const PLAN_BY_AMOUNT = { 1000: "community", 3500: "biz" };
 
 /* -----------------------------
-   Lemlist helpers (API v1)
+   Lemlist (Basic Auth)
 ----------------------------- */
 const LEMLIST_API_KEY = process.env.LEMLIST_API_KEY;
 const LEMLIST_API_URL = "https://api.lemlist.com/api";
 
-// On envoie les deux variantes d'en-têtes acceptées par leur API (selon les pages de doc / environnements)
-const lemlistHeaders = {
-  Authorization: `Api-Key ${LEMLIST_API_KEY}`,
-  "X-API-Key": LEMLIST_API_KEY,
-  "Content-Type": "application/json",
-};
+// username = API key, password vide
+const lemlistAuthHeader = "Basic " + Buffer.from(`${LEMLIST_API_KEY}:`).toString("base64");
 
-/** Création "douce" du contact (on ignore les duplications) */
-async function ensureLemlistContact(email, firstName = "", lastName = "") {
-  try {
-    const res = await fetch(`${LEMLIST_API_URL}/contacts`, {
-      method: "POST",
-      headers: lemlistHeaders,
-      body: JSON.stringify({ email, firstName, lastName, company: "Moovers" }),
-    });
+/** Ajoute un email à une campagne (et crée le lead si besoin) */
+async function lemlistAddToCampaign(campaignId, email) {
+  const url = `${LEMLIST_API_URL}/campaigns/${campaignId}/leads/${encodeURIComponent(
+    email
+  )}?deduplicate=true`;
 
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      // 409 (ou 400 spécifique) = déjà présent / données non indispensables → on ne bloque pas le flux
-      console.warn(`Lemlist create contact non-ok (${res.status}): ${txt}`);
-    } else {
-      console.log(`Lemlist contact créé: ${email}`);
-    }
-  } catch (e) {
-    console.warn("Lemlist create contact – exception (ignorée):", e.message);
-  }
-}
-
-/** Ajout dans la campagne (crée le lead si besoin) */
-async function addToCampaign(campaignId, email) {
-  const url = `${LEMLIST_API_URL}/campaigns/${campaignId}/leads/${encodeURIComponent(email)}?deduplicate=true`;
-  const res = await fetch(url, { method: "POST", headers: lemlistHeaders });
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: lemlistAuthHeader, "Content-Type": "application/json" },
+  });
 
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
-    throw new Error(`Erreur Lemlist Campaign: ${res.status} ${res.statusText} – ${txt}`);
+    throw new Error(`Lemlist campaign error: ${res.status} ${res.statusText} – ${txt}`);
   }
   return res.json().catch(() => ({}));
 }
@@ -100,7 +84,20 @@ const getRawBody = (req) =>
   });
 
 /* -----------------------------
-   Webhook handler
+   Helpers
+----------------------------- */
+function pickReferralFromCustomFields(session) {
+  if (!Array.isArray(session?.custom_fields)) return null;
+  const f = session.custom_fields.find(
+    (x) =>
+      (x.key && x.key.toLowerCase().includes("parrain")) ||
+      (x.label && x.label.toLowerCase().includes("parrain"))
+  );
+  return f?.text?.value || null;
+}
+
+/* -----------------------------
+   Webhook
 ----------------------------- */
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
@@ -108,6 +105,7 @@ export default async function handler(req, res) {
   const sig = req.headers["stripe-signature"];
   if (!sig) return res.status(400).send("No signature header");
 
+  // Construire l'event avec raw body + secrets
   let event, body;
   try {
     body = await getRawBody(req);
@@ -119,7 +117,7 @@ export default async function handler(req, res) {
         ok = true;
         break;
       } catch {
-        // try next secret
+        // try next
       }
     }
     if (!ok) throw new Error("Webhook secret invalide");
@@ -127,17 +125,18 @@ export default async function handler(req, res) {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Choix Stripe client selon live/test
+  // Choix du client Stripe (test/live)
   let stripeClient = stripeLive;
   if (event.livemode === false && stripeTest) stripeClient = stripeTest;
 
-  if (event.type === "checkout.session.completed" || event.type === "invoice.paid") {
+  /* -------------------------------------------------
+     1) checkout.session.completed → onboarding + parrainage + Lemlist
+  ------------------------------------------------- */
+  if (event.type === "checkout.session.completed") {
     const session = event.data.object;
 
-    // email client
     const customerEmail = session?.customer_details?.email || session?.customer_email || null;
     if (!customerEmail) {
-      console.warn("Stripe webhook: pas d'email dans la session");
       return res.status(200).json({ received: true, warning: "No email found" });
     }
 
@@ -157,18 +156,20 @@ export default async function handler(req, res) {
 
     const amountCents = session.amount_total || session.total || 0;
 
-    // Détermination du rôle
+    // Déterminer le rôle
     let role = "member";
     if (priceId && PLAN[priceId]) role = PLAN[priceId];
     else if (PLAN_BY_AMOUNT[amountCents]) role = PLAN_BY_AMOUNT[amountCents];
 
     try {
       const snapshot = await db.collection("users").where("email", "==", customerEmail).get();
-      if (!snapshot.empty) {
+      if (snapshot.empty) {
+        console.warn(`Firestore: utilisateur introuvable (${customerEmail})`);
+      } else {
         const userDoc = snapshot.docs[0];
         const userId = userDoc.id;
 
-        // Update Firestore
+        // MAJ de base
         await userDoc.ref.update({
           role,
           lastPayment: admin.firestore.FieldValue.serverTimestamp(),
@@ -176,42 +177,31 @@ export default async function handler(req, res) {
           subscriptionId: session.subscription || null,
         });
 
-        /* -----------------------------
-           Lemlist: créer (souple) + ajouter campagne
-        ----------------------------- */
+        // Lemlist → ajouter en campagne par rôle (création implicite du lead)
         try {
-          const fullName = session?.customer_details?.name || "";
-          const [firstName = "", lastName = ""] = fullName.split(" ");
-          await ensureLemlistContact(customerEmail, firstName, lastName);
-
-          const campaignIds = {
+          const campaigns = {
             community: process.env.LEMLIST_CAMPAIGN_COMMUNITY,
             biz: process.env.LEMLIST_CAMPAIGN_BIZ,
           };
-          const target = campaignIds[role];
-          if (target) {
-            await addToCampaign(target, customerEmail);
-            console.log(`Lemlist OK: ${customerEmail} → ${role} (campagne ${target})`);
+          const targetCampaign = campaigns[role];
+          if (targetCampaign) {
+            await lemlistAddToCampaign(targetCampaign, customerEmail);
+            console.log(`Lemlist: ${customerEmail} → ${role} (campagne ${targetCampaign})`);
           }
-        } catch (err) {
-          console.error("🔥 Erreur Lemlist:", err.message);
+        } catch (e) {
+          console.error("🔥 Lemlist error:", e.message);
         }
 
-        /* -----------------------------
-           Parrainage
-        ----------------------------- */
-        // On lit d'abord les custom_fields (Checkout), sinon metadata (au cas où tu l’injectes côté serveur)
+        // Parrainage (uniquement ici car custom_fields dispo sur checkout.session.completed)
         const referralCodeUsed =
-          (Array.isArray(session.custom_fields)
-            ? session.custom_fields.find((f) =>
-                (f.key || "").toLowerCase().includes("parrain")
-              )?.text?.value
-            : null) ||
-          session?.metadata?.referralCode ||
-          null;
+          pickReferralFromCustomFields(session) || session?.metadata?.referralCode || null;
 
         if (referralCodeUsed) {
-          const refSnap = await db.collection("users").where("referralCode", "==", referralCodeUsed).get();
+          const refSnap = await db
+            .collection("users")
+            .where("referralCode", "==", referralCodeUsed)
+            .get();
+
           if (!refSnap.empty) {
             const parrainDoc = refSnap.docs[0];
             const parrainData = parrainDoc.data();
@@ -221,6 +211,7 @@ export default async function handler(req, res) {
             const monthGranted = newCount % 2 === 0;
             if (monthGranted) freeMonths += 1;
 
+            // MAJ parrain
             await parrainDoc.ref.update({
               referralsCount: newCount,
               freeMonths,
@@ -232,12 +223,12 @@ export default async function handler(req, res) {
               }),
             });
 
+            // MAJ filleul
             await userDoc.ref.update({ referredBy: parrainDoc.id, referralCodeUsed });
 
-            // Mois offert (coupon) au parrain
+            // Mois offert via coupon
             if (monthGranted && parrainData.subscriptionId) {
               try {
-                // chercher/creer le coupon
                 const coupons = await stripeClient.coupons.list({ limit: 100 });
                 let coupon = coupons.data.find((c) => c.name === "1 mois offert");
                 if (!coupon) {
@@ -247,6 +238,7 @@ export default async function handler(req, res) {
                     name: "1 mois offert",
                   });
                 }
+
                 const sub = await stripeClient.subscriptions.retrieve(parrainData.subscriptionId);
                 if (!sub.discount) {
                   await stripeClient.subscriptions.update(parrainData.subscriptionId, { coupon: coupon.id });
@@ -260,14 +252,61 @@ export default async function handler(req, res) {
             }
           }
         }
-      } else {
-        console.warn(`Utilisateur introuvable dans Firestore: ${customerEmail}`);
       }
     } catch (err) {
-      console.error("Erreur Firestore:", err);
+      console.error("🔥 Erreur Firestore:", err);
       return res.status(500).json({ error: "Database error", received: true });
     }
+
+    return res.status(200).json({ received: true, eventType: event.type });
   }
 
+  /* -------------------------------------------------
+     2) invoice.paid → renouvellement (pas de custom_fields ici)
+  ------------------------------------------------- */
+  if (event.type === "invoice.paid") {
+    const invoice = event.data.object;
+
+    try {
+      // email depuis le customer
+      const customerId = invoice.customer;
+      let customerEmail = null;
+      if (customerId) {
+        const customer = await stripeClient.customers.retrieve(customerId);
+        customerEmail = customer?.email || null;
+      }
+
+      if (!customerEmail) {
+        return res.status(200).json({ received: true, warning: "No email on invoice" });
+      }
+
+      // déduction rôle via priceId ou montant de l'Invoice
+      let role = "member";
+      const priceId = invoice.lines?.data?.[0]?.price?.id || null;
+      const amountCents = invoice.amount_paid || invoice.amount_due || 0;
+      if (priceId && PLAN[priceId]) role = PLAN[priceId];
+      else if (PLAN_BY_AMOUNT[amountCents]) role = PLAN_BY_AMOUNT[amountCents];
+
+      const snapshot = await db.collection("users").where("email", "==", customerEmail).get();
+      if (!snapshot.empty) {
+        const userDoc = snapshot.docs[0];
+        await userDoc.ref.update({
+          role,
+          lastPayment: admin.firestore.FieldValue.serverTimestamp(),
+          stripeCustomerId: customerId || null,
+          subscriptionId: invoice.subscription || null,
+        });
+      }
+
+      // (On ne traite PAS le parrainage ici: pas de custom_fields à cette étape)
+    } catch (e) {
+      console.error("invoice.paid handling error:", e.message);
+      return res.status(500).json({ error: "Invoice handling error", received: true });
+    }
+
+    return res.status(200).json({ received: true, eventType: event.type });
+  }
+
+  // autres events → ack
   return res.status(200).json({ received: true, eventType: event.type });
 }
