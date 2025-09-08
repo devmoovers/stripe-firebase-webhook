@@ -44,14 +44,14 @@ const PLAN = {
 const PLAN_BY_AMOUNT = { 1000: "community", 3500: "biz" };
 
 /* -----------------------------
-   Lemlist helpers (Basic Auth)
+   Lemlist helpers (Api-Key header)
 ----------------------------- */
 const LEMLIST_API_KEY = process.env.LEMLIST_API_KEY;
 const LEMLIST_API_URL = "https://api.lemlist.com/api";
 
-// Auth Lemlist en Basic (username = clé, password vide)
+// Auth Lemlist → format attendu par leur API
 const lemlistHeaders = {
-  Authorization: "Basic " + Buffer.from(`${LEMLIST_API_KEY}:`).toString("base64"),
+  Authorization: `Api-Key ${LEMLIST_API_KEY}`,
   "Content-Type": "application/json",
 };
 
