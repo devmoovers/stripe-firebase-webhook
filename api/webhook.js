@@ -41,43 +41,32 @@ const PLAN = {
 const PLAN_BY_AMOUNT = { 1000: "community", 3500: "biz" };
 
 /* -----------------------------
-   Lemlist helpers (API v1)
+   Lemlist helpers (Basic Auth)
 ----------------------------- */
 const LEMLIST_API_KEY = process.env.LEMLIST_API_KEY;
 const LEMLIST_API_URL = "https://api.lemlist.com/api";
 
+// Auth Lemlist en Basic (clé en username, mot de passe vide)
 const lemlistHeaders = {
-  Authorization: `Bearer ${LEMLIST_API_KEY}`,
+  Authorization: "Basic " + Buffer.from(`${LEMLIST_API_KEY}:`).toString("base64"),
   "Content-Type": "application/json",
 };
 
-/** Création "douce" du lead */
-async function ensureLemlistLead(email, firstName = "", lastName = "") {
-  try {
-    const res = await fetch(`${LEMLIST_API_URL}/leads`, {
-      method: "POST",
-      headers: lemlistHeaders,
-      body: JSON.stringify({ email, firstName, lastName, company: "Moovers" }),
-    });
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      console.warn(`Lemlist create lead non-ok (${res.status}): ${txt}`);
-    } else {
-      console.log(`Lemlist lead créé: ${email}`);
-    }
-  } catch (e) {
-    console.warn("Lemlist create lead – exception (ignorée):", e.message);
-  }
-}
-
-/** Ajout dans la campagne */
-async function addToCampaign(campaignId, email) {
+/** Ajout (ou création implicite) d’un lead dans une campagne */
+async function addToCampaign(campaignId, email, firstName = "", lastName = "") {
   const url = `${LEMLIST_API_URL}/campaigns/${campaignId}/leads/${encodeURIComponent(
     email
   )}?deduplicate=true`;
 
-  const res = await fetch(url, { method: "POST", headers: lemlistHeaders });
+  const res = await fetch(url, {
+    method: "POST",
+    headers: lemlistHeaders,
+    body: JSON.stringify({
+      firstName,
+      lastName,
+      companyName: "Moovers",
+    }),
+  });
 
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
@@ -136,7 +125,6 @@ export default async function handler(req, res) {
   if (event.type === "checkout.session.completed" || event.type === "invoice.paid") {
     const session = event.data.object;
 
-    // email client
     const customerEmail = session?.customer_details?.email || session?.customer_email || null;
     if (!customerEmail) {
       console.warn("Stripe webhook: pas d'email dans la session");
@@ -170,7 +158,6 @@ export default async function handler(req, res) {
         const userDoc = snapshot.docs[0];
         const userId = userDoc.id;
 
-        // Update Firestore
         await userDoc.ref.update({
           role,
           lastPayment: admin.firestore.FieldValue.serverTimestamp(),
@@ -184,16 +171,14 @@ export default async function handler(req, res) {
         try {
           const fullName = session?.customer_details?.name || "";
           const [firstName = "", lastName = ""] = fullName.split(" ");
-          await ensureLemlistLead(customerEmail, firstName, lastName);
-
           const campaignIds = {
             community: process.env.LEMLIST_CAMPAIGN_COMMUNITY,
             biz: process.env.LEMLIST_CAMPAIGN_BIZ,
           };
           const target = campaignIds[role];
           if (target) {
-            await addToCampaign(target, customerEmail);
-            console.log(`Lemlist OK: ${customerEmail} → ${role} (campagne ${target})`);
+            await addToCampaign(target, customerEmail, firstName, lastName);
+            console.log(`✅ Lemlist: ${customerEmail} → ${role} (campagne ${target})`);
           }
         } catch (err) {
           console.error("🔥 Erreur Lemlist:", err.message);
@@ -235,7 +220,6 @@ export default async function handler(req, res) {
 
             await userDoc.ref.update({ referredBy: parrainDoc.id, referralCodeUsed });
 
-            // Mois offert (coupon) au parrain
             if (monthGranted && parrainData.subscriptionId) {
               try {
                 const coupons = await stripeClient.coupons.list({ limit: 100 });
