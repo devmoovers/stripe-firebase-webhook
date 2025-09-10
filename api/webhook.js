@@ -36,12 +36,21 @@ const webhookSecrets = [
    Plans Stripe → rôles Firestore
 ----------------------------- */
 const PLAN = {
-  "price_1Rt7ErFD9N3apMZl5ZJra4sW": "community",
-  "price_1Rt7ILFD9N3apMZlt1kpm4Lx": "biz",
-  "price_1RtmDdFD9N3apMZlul64n316": "community",
-  "price_1RtmDpFD9N3apMZl6QpQyaQt": "biz",
+  "price_1Rt7ErFD9N3apMZl5ZJra4sW": "community",// Mensuel Prod
+  "price_1Rt7ILFD9N3apMZlt1kpm4Lx": "biz",// Mensuel Prod
+  "price_1RtmDdFD9N3apMZlul64n316": "community",// Mensuel Test
+  "price_1RtmDpFD9N3apMZl6QpQyaQt": "biz", // Mensuel Test
+  "price_1S5nMZFD9N3apMZlLSVe0xkv": "community", // Annuel Prod
+  "price_1S5nLbFD9N3apMZlZyPcRKIo": "biz", // Annuel Prod
+  "price_1S5o5VFD9N3apMZlg8SUjudP": "community", // Annuel Test
+  "price_1S5oARFD9N3apMZlc81ceXiD": "biz", // Annuel Test
 };
-const PLAN_BY_AMOUNT = { 1000: "community", 3500: "biz" };
+const PLAN_BY_AMOUNT = { 
+  1000: "community",   // Community mensuel
+  3500: "biz",         // Biz mensuel
+  10000: "community",  // Community annuel
+  35000: "biz"         // Biz annuel
+};
 
 /* -----------------------------
    Lemlist helpers (Basic Auth CORRIGÉ)
