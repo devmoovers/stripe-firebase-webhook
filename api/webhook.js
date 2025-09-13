@@ -36,29 +36,29 @@ const webhookSecrets = [
    Plans Stripe → rôles Firestore
 ----------------------------- */
 const PLAN = {
-  "price_1Rt7ErFD9N3apMZl5ZJra4sW": "community",// Mensuel Prod
-  "price_1Rt7ILFD9N3apMZlt1kpm4Lx": "biz",// Mensuel Prod
-  "price_1RtmDdFD9N3apMZlul64n316": "community",// Mensuel Test
-  "price_1RtmDpFD9N3apMZl6QpQyaQt": "biz", // Mensuel Test
+  "price_1Rt7ErFD9N3apMZl5ZJra4sW": "community", // Mensuel Prod
+  "price_1Rt7ILFD9N3apMZlt1kpm4Lx": "biz",       // Mensuel Prod
+  "price_1RtmDdFD9N3apMZlul64n316": "community", // Mensuel Test
+  "price_1RtmDpFD9N3apMZl6QpQyaQt": "biz",       // Mensuel Test
   "price_1S5nMZFD9N3apMZlLSVe0xkv": "community", // Annuel Prod
-  "price_1S5nLbFD9N3apMZlZyPcRKIo": "biz", // Annuel Prod
+  "price_1S5nLbFD9N3apMZlZyPcRKIo": "biz",       // Annuel Prod
   "price_1S5o5VFD9N3apMZlg8SUjudP": "community", // Annuel Test
-  "price_1S5oARFD9N3apMZlc81ceXiD": "biz", // Annuel Test
+  "price_1S5oARFD9N3apMZlc81ceXiD": "biz",       // Annuel Test
 };
-const PLAN_BY_AMOUNT = { 
+const PLAN_BY_AMOUNT = {
   1000: "community",   // Community mensuel
   3500: "biz",         // Biz mensuel
   10000: "community",  // Community annuel
-  35000: "biz"         // Biz annuel
+  35000: "biz",        // Biz annuel
 };
 
 /* -----------------------------
-   Lemlist helpers (Basic Auth CORRIGÉ)
+   Lemlist helpers (Basic Auth)
 ----------------------------- */
 const LEMLIST_API_KEY = process.env.LEMLIST_API_KEY;
 const LEMLIST_API_URL = "https://api.lemlist.com/api";
 
-// Auth Lemlist CORRIGÉ : username VIDE (:), password = clé API
+// Auth Lemlist : username VIDE (:), password = clé API
 const lemlistHeaders = {
   Authorization: "Basic " + Buffer.from(`:${LEMLIST_API_KEY}`).toString("base64"),
   "Content-Type": "application/json",
@@ -67,29 +67,43 @@ const lemlistHeaders = {
 // Debug pour vérifier que la clé est bien injectée
 console.log("🔑 Lemlist key loaded:", LEMLIST_API_KEY ? "✅ OK" : "❌ MISSING");
 
-/** Ajout (ou création implicite) d'un lead dans une campagne */
+function isAlreadyInCampaignError(text = "") {
+  const t = String(text).toLowerCase();
+  return (
+    t.includes("already") &&
+    (t.includes("in this campaign") ||
+      t.includes("in campaign") ||
+      t.includes("in other campaign"))
+  );
+}
+
+/** Ajoute un lead dans une campagne, même s'il est déjà dans d'autres campagnes */
 async function addToCampaign(campaignId, email, firstName = "", lastName = "") {
-  const url = `${LEMLIST_API_URL}/campaigns/${campaignId}/leads/${encodeURIComponent(
-    email
-  )}?deduplicate=true`;
+  const base = `${LEMLIST_API_URL}/campaigns/${campaignId}/leads/${encodeURIComponent(email)}`;
+  const body = JSON.stringify({ firstName, lastName, companyName: "" });
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: lemlistHeaders,
-    body: JSON.stringify({
-      firstName,
-      lastName,
-      companyName: "",
-    }),
-  });
+  // 1) Essai avec deduplicate=false (autoriser l'ajout même si lead existe ailleurs)
+  for (const qs of ["?deduplicate=false", ""]) {
+    const res = await fetch(`${base}${qs}`, {
+      method: "POST",
+      headers: lemlistHeaders,
+      body,
+    });
 
-  if (!res.ok) {
+    if (res.ok) return res.json().catch(() => ({}));
+
     const txt = await res.text().catch(() => "");
-    throw new Error(
-      `Erreur Lemlist Campaign: ${res.status} ${res.statusText} – ${txt}`
-    );
+
+    // Si le lead est déjà dans la campagne (ou une autre), on considère OK (idempotent)
+    if (res.status === 409 && isAlreadyInCampaignError(txt)) {
+      return { alreadyInCampaign: true };
+    }
+
+    // Si 409 sur le premier essai, tente la 2e variante (sans param)
+    if (res.status === 409 && qs === "?deduplicate=false") continue;
+
+    throw new Error(`Erreur Lemlist Campaign: ${res.status} ${res.statusText} – ${txt}`);
   }
-  return res.json().catch(() => ({}));
 }
 
 /* -----------------------------
@@ -140,7 +154,8 @@ export default async function handler(req, res) {
   if (event.type === "checkout.session.completed" || event.type === "invoice.paid") {
     const session = event.data.object;
 
-    const customerEmail = session?.customer_details?.email || session?.customer_email || null;
+    const customerEmail =
+      session?.customer_details?.email || session?.customer_email || null;
     if (!customerEmail) {
       console.warn("Stripe webhook: pas d'email dans la session");
       return res.status(200).json({ received: true, warning: "No email found" });
@@ -181,7 +196,7 @@ export default async function handler(req, res) {
         });
 
         /* -----------------------------
-           Lemlist
+           Lemlist (ajout même si déjà ailleurs)
         ----------------------------- */
         try {
           const fullName = session?.customer_details?.name || "";
